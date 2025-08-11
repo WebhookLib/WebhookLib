@@ -11,7 +11,7 @@
   [![Website](https://img.shields.io/badge/Website-webhooklib.luau.page-purple.svg)](http://webhooklib.luau.page/)
   [![Stars](https://img.shields.io/github/stars/WebhookLib/WebhookLib.svg)](https://github.com/WebhookLib/WebhookLib/stargazers)
   [![Issues](https://img.shields.io/github/issues/WebhookLib/WebhookLib.svg)](https://github.com/WebhookLib/WebhookLib/issues)
-  [![Downloads](https://img.shields.io/badge/downloads-2k+-brightgreen.svg)](https://create.roblox.com/store/asset/101200026339651/WebhookLib)
+  [![Downloads](https://img.shields.io/badge/downloads-50-brightgreen.svg)](https://create.roblox.com/store/asset/101200026339651/WebhookLib)
   <!-- [![DevForum](https://img.shields.io/badge/DevForum-Coming%20Soon-orange.svg)](https://devforum.roblox.com) -->
   
   [📖 Documentation](http://webhooklib.luau.page/) • [🛒 Get Model](https://create.roblox.com/store/asset/101200026339651/WebhookLib) • [🐛 Report Issues](https://github.com/WebhookLib/WebhookLib/issues) • [💬 Discussions](https://github.com/WebhookLib/WebhookLib/discussions)
