@@ -17,6 +17,9 @@ PURPOSE:
   - Optional profanity filtering with custom word lists
   - Comprehensive debugging and logging capabilities
   - Thread-safe operations that won't block the main game thread
+  - Send messages to Discord threads
+  - Edit and delete webhook messages
+  - Message ID tracking and logging
 
 REQUIRED ROBLOX GAME SETTINGS:
   1. Go to Game Settings > Security tab
@@ -34,7 +37,7 @@ HOW TO OBTAIN A DISCORD WEBHOOK URL (USING THE PROXY):
 7. You will get a new URL in the format:
    https://webhook.lewisakura.moe/api/webhooks/ID/TOKEN
 8. Use this new URL in your Roblox script instead of the normal Discord link
-9. Keep this URL secure – anyone with access can send messages to your Discord
+9. Keep this URL secure -- anyone with access can send messages to your Discord
 
 MINIMAL SETUP STEPS:
   1. Place this ModuleScript in ReplicatedStorage and name it "WebhookLib"
@@ -48,6 +51,7 @@ CONFIGURATION OPTIONS:
   - queue_rate_limit: Requests per second limit (default: none, only enabled if set)
   - filter_profanity: Enable profanity filtering (default: false)
   - debug: Enable debug logging (default: false)
+  - track_message_ids: Store message IDs for editing/deleting (default: false)
   - All other options are available but not required
 
 PRODUCTION CONSIDERATIONS:
@@ -61,7 +65,9 @@ PRODUCTION CONSIDERATIONS:
 PUT IT IN ReplicatedStorage
 by bluezly!
 https://webhooklib.github.io/
+Enhanced with Thread Support, Message Editing, and Deletion
 --]]
+
 -- Services
 local HttpService = game:GetService("HttpService")
 local DataStoreService = game:GetService("DataStoreService")
@@ -94,7 +100,9 @@ local DEFAULT_OPTIONS = {
 	debug = false,
 	datastore_name = "WebhookLib_JoinCounts",
 	filter_profanity = false,
-	banned_words = {} -- Custom banned words to add to defaults
+	banned_words = {}, -- Custom banned words to add to defaults
+	track_message_ids = false, -- Store message IDs for editing/deleting
+	max_stored_messages = 100 -- Maximum number of message IDs to store
 }
 
 -- Default banned words list (keep it minimal and appropriate)
@@ -151,6 +159,31 @@ local function safeJSONEncode(data)
 	return success and result or nil
 end
 
+local function extractWebhookInfo(url)
+	-- Extract webhook ID and token from URL
+	local pattern = "/webhooks/(%d+)/([%w%-_]+)"
+	local id, token = url:match(pattern)
+	return id, token
+end
+
+local function buildWebhookUrl(baseUrl, threadId)
+	if threadId then
+		local separator = baseUrl:find("?") and "&" or "?"
+		return baseUrl .. separator .. "thread_id=" .. threadId
+	end
+	return baseUrl
+end
+
+local function buildMessageUrl(baseUrl, messageId)
+	-- Convert webhook URL to message-specific URL
+	local id, token = extractWebhookInfo(baseUrl)
+	if id and token then
+		local baseApiUrl = baseUrl:match("(.+)/webhooks/")
+		return baseApiUrl .. "/webhooks/" .. id .. "/" .. token .. "/messages/" .. messageId
+	end
+	return nil
+end
+
 -- Constructor
 function WebhookLib.new(url, options)
 	if not url or type(url) ~= "string" or url == "" then
@@ -184,6 +217,8 @@ function WebhookLib.new(url, options)
 	self._queueRunning = false
 	self._lastRequestTime = 0
 	self._shutdown = false
+	self._messageIds = {} -- Store message IDs for editing/deleting
+	self._messageCount = 0
 
 	-- DataStore initialization
 	self._dataStore = nil
@@ -214,6 +249,7 @@ function WebhookLib.new(url, options)
 	end
 	self:_log("DataStore:", self._dataStore and "AVAILABLE" or "UNAVAILABLE")
 	self:_log("Profanity filter:", self._config.filter_profanity and "ENABLED" or "DISABLED")
+	self:_log("Message ID tracking:", self._config.track_message_ids and "ENABLED" or "DISABLED")
 
 	-- Start background queue processor only if queue is enabled
 	if self._config.queue_enabled then
@@ -233,6 +269,37 @@ function WebhookLib:_log(...)
 		end
 		print("[WebhookLib]", table.concat(args, " "))
 	end
+end
+
+function WebhookLib:_storeMessageId(messageId, metadata)
+	if not self._config.track_message_ids or not messageId then return end
+
+	self._messageCount = self._messageCount + 1
+	local key = "msg_" .. self._messageCount
+
+	-- Store with metadata
+	self._messageIds[key] = {
+		id = messageId,
+		timestamp = getCurrentTimestamp(),
+		metadata = metadata or {}
+	}
+
+	-- Clean old messages if we exceed the limit
+	if self._messageCount > self._config.max_stored_messages then
+		local oldestKey = "msg_" .. (self._messageCount - self._config.max_stored_messages)
+		self._messageIds[oldestKey] = nil
+	end
+
+	self:_log("Stored message ID:", messageId, "as", key)
+end
+
+function WebhookLib:_findMessageById(messageId)
+	for key, data in pairs(self._messageIds) do
+		if data.id == messageId then
+			return key, data
+		end
+	end
+	return nil, nil
 end
 
 function WebhookLib:_startQueueProcessor()
@@ -288,6 +355,16 @@ function WebhookLib:_executeRequest(request)
 	if response.StatusCode >= 200 and response.StatusCode < 300 then
 		-- Success
 		self:_log("Request completed successfully")
+
+		-- Extract message ID from response if available
+		if response.Body and request.trackMessageId then
+			local responseData = safeJSONDecode(response.Body)
+			if responseData and responseData.id then
+				self:_log("Message ID received:", responseData.id)
+				self:_storeMessageId(responseData.id, request.messageMetadata)
+			end
+		end
+
 		if request.onSuccess then
 			task.spawn(request.onSuccess, response)
 		end
@@ -366,7 +443,7 @@ function WebhookLib:_handleRequestFailure(request, errorMsg)
 	end
 end
 
-function WebhookLib:_queueRequest(httpRequest, onSuccess, onFailure)
+function WebhookLib:_queueRequest(httpRequest, onSuccess, onFailure, trackMessageId, messageMetadata)
 	if not HttpService.HttpEnabled then
 		self:_log("ERROR: HTTP requests are disabled in game settings")
 		if onFailure then
@@ -380,7 +457,9 @@ function WebhookLib:_queueRequest(httpRequest, onSuccess, onFailure)
 		onSuccess = onSuccess,
 		onFailure = onFailure,
 		attempts = 0,
-		timestamp = getCurrentTimestamp()
+		timestamp = getCurrentTimestamp(),
+		trackMessageId = trackMessageId or false,
+		messageMetadata = messageMetadata or {}
 	}
 
 	if self._config.queue_enabled then
@@ -579,7 +658,7 @@ end
 
 -- Public API Methods
 
-function WebhookLib:SendMessage(content, overrides)
+function WebhookLib:SendMessage(content, overrides, threadId)
 	if not content then
 		self:_log("SendMessage: content parameter is required")
 		return false
@@ -600,8 +679,10 @@ function WebhookLib:SendMessage(content, overrides)
 		return false
 	end
 
+	local url = buildWebhookUrl(self._url, threadId)
+
 	local httpRequest = {
-		Url = self._url,
+		Url = url,
 		Method = "POST",
 		Headers = {
 			["Content-Type"] = "application/json"
@@ -609,12 +690,30 @@ function WebhookLib:SendMessage(content, overrides)
 		Body = body
 	}
 
-	self:_queueRequest(httpRequest)
+	local messageMetadata = {
+		type = "message",
+		content = filteredContent,
+		threadId = threadId
+	}
+
+	self:_queueRequest(httpRequest, nil, nil, self._config.track_message_ids, messageMetadata)
 	self:_log("Queued text message:", filteredContent:sub(1, 50) .. (#filteredContent > 50 and "..." or ""))
+	if threadId then
+		self:_log("Target thread ID:", threadId)
+	end
 	return true
 end
 
-function WebhookLib:SendEmbed(embedTable)
+function WebhookLib:SendMessageInThread(content, threadId, overrides)
+	if not threadId then
+		self:_log("SendMessageInThread: threadId parameter is required")
+		return false
+	end
+
+	return self:SendMessage(content, overrides, threadId)
+end
+
+function WebhookLib:SendEmbed(embedTable, threadId)
 	if not embedTable or type(embedTable) ~= "table" then
 		self:_log("SendEmbed: embedTable must be a valid table")
 		return false
@@ -634,8 +733,10 @@ function WebhookLib:SendEmbed(embedTable)
 		return false
 	end
 
+	local url = buildWebhookUrl(self._url, threadId)
+
 	local httpRequest = {
-		Url = self._url,
+		Url = url,
 		Method = "POST",
 		Headers = {
 			["Content-Type"] = "application/json"
@@ -643,12 +744,30 @@ function WebhookLib:SendEmbed(embedTable)
 		Body = body
 	}
 
-	self:_queueRequest(httpRequest)
+	local messageMetadata = {
+		type = "embed",
+		title = sanitizedEmbed.title,
+		threadId = threadId
+	}
+
+	self:_queueRequest(httpRequest, nil, nil, self._config.track_message_ids, messageMetadata)
 	self:_log("Queued embed:", sanitizedEmbed.title or "No title")
+	if threadId then
+		self:_log("Target thread ID:", threadId)
+	end
 	return true
 end
 
-function WebhookLib:SendMultipleEmbeds(embeds)
+function WebhookLib:SendEmbedInThread(embedTable, threadId)
+	if not threadId then
+		self:_log("SendEmbedInThread: threadId parameter is required")
+		return false
+	end
+
+	return self:SendEmbed(embedTable, threadId)
+end
+
+function WebhookLib:SendMultipleEmbeds(embeds, threadId)
 	if not embeds or type(embeds) ~= "table" or #embeds == 0 then
 		self:_log("SendMultipleEmbeds: embeds must be a non-empty array")
 		return false
@@ -679,8 +798,10 @@ function WebhookLib:SendMultipleEmbeds(embeds)
 		return false
 	end
 
+	local url = buildWebhookUrl(self._url, threadId)
+
 	local httpRequest = {
-		Url = self._url,
+		Url = url,
 		Method = "POST",
 		Headers = {
 			["Content-Type"] = "application/json"
@@ -688,12 +809,117 @@ function WebhookLib:SendMultipleEmbeds(embeds)
 		Body = body
 	}
 
-	self:_queueRequest(httpRequest)
+	local messageMetadata = {
+		type = "multiple_embeds",
+		count = #sanitizedEmbeds,
+		threadId = threadId
+	}
+
+	self:_queueRequest(httpRequest, nil, nil, self._config.track_message_ids, messageMetadata)
 	self:_log("Queued", #sanitizedEmbeds, "embeds")
+	if threadId then
+		self:_log("Target thread ID:", threadId)
+	end
 	return true
 end
 
-function WebhookLib:SendJoinMessage(player)
+function WebhookLib:EditMessage(messageId, content, embeds)
+	if not messageId then
+		self:_log("EditMessage: messageId parameter is required")
+		return false
+	end
+
+	if not content and not embeds then
+		self:_log("EditMessage: Either content or embeds parameter is required")
+		return false
+	end
+
+	local messageUrl = buildMessageUrl(self._url, messageId)
+	if not messageUrl then
+		self:_log("EditMessage: Failed to build message URL")
+		return false
+	end
+
+	local payload = {}
+
+	if content then
+		payload.content = truncateText(self:_filterText(content), MAX_CONTENT_LENGTH)
+	end
+
+	if embeds then
+		if type(embeds) ~= "table" then
+			self:_log("EditMessage: embeds must be a table")
+			return false
+		end
+
+		local sanitizedEmbeds = {}
+		if embeds[1] then
+			-- Array of embeds
+			for i = 1, math.min(#embeds, MAX_EMBEDS_PER_MESSAGE) do
+				if type(embeds[i]) == "table" then
+					table.insert(sanitizedEmbeds, self:_sanitizeEmbed(embeds[i]))
+				end
+			end
+		else
+			-- Single embed object
+			table.insert(sanitizedEmbeds, self:_sanitizeEmbed(embeds))
+		end
+
+		payload.embeds = sanitizedEmbeds
+	end
+
+	local body = safeJSONEncode(payload)
+	if not body then
+		self:_log("EditMessage: Failed to encode JSON payload")
+		return false
+	end
+
+	local httpRequest = {
+		Url = messageUrl,
+		Method = "PATCH",
+		Headers = {
+			["Content-Type"] = "application/json"
+		},
+		Body = body
+	}
+
+	self:_queueRequest(httpRequest)
+	self:_log("Queued message edit for ID:", messageId)
+	return true
+end
+
+function WebhookLib:DeleteMessage(messageId)
+	if not messageId then
+		self:_log("DeleteMessage: messageId parameter is required")
+		return false
+	end
+
+	local messageUrl = buildMessageUrl(self._url, messageId)
+	if not messageUrl then
+		self:_log("DeleteMessage: Failed to build message URL")
+		return false
+	end
+
+	local httpRequest = {
+		Url = messageUrl,
+		Method = "DELETE",
+		Headers = {}
+	}
+
+	self:_queueRequest(httpRequest, function()
+		-- Remove from stored messages if tracked
+		local key, _ = self:_findMessageById(messageId)
+		if key then
+			self._messageIds[key] = nil
+			self:_log("Removed message ID from storage:", messageId)
+		end
+	end)
+
+	self:_log("Queued message deletion for ID:", messageId)
+	return true
+end
+
+function WebhookLib:SendJoinMessage(player, threadId)
 	if not player or not player:IsA("Player") then
 		self:_log("SendJoinMessage: Invalid player object provided")
 		return false
@@ -749,13 +975,13 @@ function WebhookLib:SendJoinMessage(player)
 			}
 		}
 
-		self:SendEmbed(embed)
+		self:SendEmbed(embed, threadId)
 	end)
 
 	return true
 end
 
-function WebhookLib:SendLeaveMessage(player)
+function WebhookLib:SendLeaveMessage(player, threadId)
 	if not player or not player:IsA("Player") then
 		self:_log("SendLeaveMessage: Invalid player object provided")
 		return false
@@ -811,13 +1037,13 @@ function WebhookLib:SendLeaveMessage(player)
 			}
 		}
 
-		self:SendEmbed(embed)
+		self:SendEmbed(embed, threadId)
 	end)
 
 	return true
 end
 
-function WebhookLib:SendCustomEvent(name, data)
+function WebhookLib:SendCustomEvent(name, data, threadId)
 	if not name then
 		self:_log("SendCustomEvent: name parameter is required")
 		return false
@@ -847,7 +1073,56 @@ function WebhookLib:SendCustomEvent(name, data)
 		}
 	}
 
-	return self:SendEmbed(embed)
+	return self:SendEmbed(embed, threadId)
+end
+
+function WebhookLib:GetStoredMessages()
+	if not self._config.track_message_ids then
+		self:_log("GetStoredMessages: Message ID tracking is disabled")
+		return {}
+	end
+
+	local messages = {}
+	for key, data in pairs(self._messageIds) do
+		table.insert(messages, {
+			key = key,
+			id = data.id,
+			timestamp = data.timestamp,
+			metadata = data.metadata
+		})
+	end
+
+	-- Sort by timestamp (newest first)
+	table.sort(messages, function(a, b)
+		return a.timestamp > b.timestamp
+	end)
+
+	return messages
+end
+
+function WebhookLib:GetLatestMessageId()
+	if not self._config.track_message_ids then
+		self:_log("GetLatestMessageId: Message ID tracking is disabled")
+		return nil
+	end
+
+	local latest = nil
+	local latestTime = 0
+
+	for _, data in pairs(self._messageIds) do
+		if data.timestamp > latestTime then
+			latestTime = data.timestamp
+			latest = data.id
+		end
+	end
+
+	return latest
+end
+
+function WebhookLib:ClearStoredMessages()
+	self._messageIds = {}
+	self._messageCount = 0
+	self:_log("Cleared all stored message IDs")
 end
 
 function WebhookLib:SetWebhookUrl(url)
@@ -922,12 +1197,30 @@ function WebhookLib:EnableQueue(enabled, rateLimit)
 	return true
 end
 
+function WebhookLib:EnableMessageTracking(enabled)
+	local wasEnabled = self._config.track_message_ids
+	self._config.track_message_ids = not not enabled
+
+	if enabled and not wasEnabled then
+		self:_log("Message ID tracking enabled")
+	elseif not enabled and wasEnabled then
+		self:_log("Message ID tracking disabled")
+		self:ClearStoredMessages()
+	end
+
+	return true
+end
+
 function WebhookLib:GetQueueSize()
 	return #self._requestQueue
 end
 
 function WebhookLib:IsQueueEnabled()
 	return self._config.queue_enabled
+end
+
+function WebhookLib:IsMessageTrackingEnabled()
+	return self._config.track_message_ids
 end
 
 function WebhookLib:GetConfiguration()
@@ -969,145 +1262,245 @@ local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TO
 -- This sends messages immediately without queueing
 webhook:SendMessage("🎮 Server started!")
 
--- EXAMPLE 2: With Queue Enabled (No Rate Limiting)
+-- EXAMPLE 2: With Queue Enabled and Message Tracking
 local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
     username = "My Game Bot",
     queue_enabled = true, -- Enables queueing but no rate limiting
-    debug = true
+    debug = true,
+    track_message_ids = true -- Enable message ID tracking for editing/deleting
 })
 
--- EXAMPLE 3: With Queue and Rate Limiting
+-- EXAMPLE 3: With Queue, Rate Limiting, and Message Tracking
 local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
     username = "🎮 My Awesome Game",
     debug = true,
     queue_rate_limit = 2, -- 2 requests per second (automatically enables queue)
     filter_profanity = true,
     default_color = 0x0099ff,
-    banned_words = {"custom", "bad", "words"} -- Adds to default list
+    banned_words = {"custom", "bad", "words"}, -- Adds to default list
+    track_message_ids = true, -- Track message IDs for editing/deleting
+    max_stored_messages = 50 -- Store up to 50 message IDs
 })
 
--- EXAMPLE 4: Enable Queue Runtime
-local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN")
-webhook:EnableQueue(true, 1) -- Enable queue with 1 request per second
+-- EXAMPLE 4: Thread Support
+local THREAD_ID = "123456789012345678" -- Your Discord thread ID
 
--- EXAMPLE 5: Rich Configuration
+-- Send message to a specific thread
+webhook:SendMessageInThread("Hello from thread!", THREAD_ID)
+
+-- Send embed to a specific thread
+webhook:SendEmbedInThread({
+    title = "Thread Message",
+    description = "This is sent to a specific thread",
+    color = 0x00ff00
+}, THREAD_ID)
+
+-- Alternative syntax (using optional threadId parameter)
+webhook:SendMessage("Hello thread!", nil, THREAD_ID)
+webhook:SendEmbed({title = "Embed in Thread"}, THREAD_ID)
+
+-- EXAMPLE 5: Message Editing and Deletion
 local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
-    username = "🤖 Advanced Bot",
-    avatar_url = "https://example.com/bot-avatar.png",
-    default_color = 0xff6600,
-    max_retries = 5,
-    retry_backoff_base = 2,
-    cache_ttl_avatar = 600, -- 10 minutes
-    datastore_name = "MyGame_WebhookData",
-    filter_profanity = true,
-    debug = false -- Production ready
+    debug = true,
+    track_message_ids = true -- Required for editing/deleting
 })
 
--- Simple Text Message
-webhook:SendMessage("🎮 Server has started successfully!")
+-- Send a message
+webhook:SendMessage("Original message")
 
--- Rich Embed Example
-webhook:SendEmbed({
-    title = "🏆 Game Statistics",
-    description = "Current server statistics and information",
-    color = 0x0099ff,
-    fields = {
-        {name = "👥 Players Online", value = tostring(#game.Players:GetPlayers()), inline = true},
-        {name = "⏰ Server Uptime", value = "2 hours 15 minutes", inline = true},
-        {name = "🌍 Region", value = "US-East", inline = true},
-        {name = "📊 Performance", value = "Excellent", inline = false}
-    },
-    thumbnail = {
-        url = "https://www.roblox.com/asset-thumbnail/image?assetId=123456789&width=420&height=420"
-    },
-    footer = {
-        text = "Automated Report"
-    },
-    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+-- Wait a moment for the message to be sent and tracked
+task.wait(2)
+
+-- Get the latest message ID
+local messageId = webhook:GetLatestMessageId()
+if messageId then
+    -- Edit the message
+    webhook:EditMessage(messageId, "Edited message content!")
+    
+    -- Wait before deleting
+    task.wait(5)
+    
+    -- Delete the message
+    webhook:DeleteMessage(messageId)
+end
+
+-- EXAMPLE 6: Manual Message ID Management
+-- If you know a specific message ID (from Discord or previous sends)
+local knownMessageId = "987654321098765432"
+
+-- Edit with new content
+webhook:EditMessage(knownMessageId, "New content here")
+
+-- Edit with new embed
+webhook:EditMessage(knownMessageId, nil, {
+    title = "Updated Embed",
+    description = "This embed replaces the original message",
+    color = 0xff0000
 })
 
--- Multiple Embeds in One Message
-local embeds = {
-    {
-        title = "📈 Player Stats",
-        color = 0x00ff00,
-        fields = {{name = "Active Players", value = "15", inline = true}}
-    },
-    {
-        title = "⚠️ Server Health",
-        color = 0xffaa00,
-        fields = {{name = "Memory Usage", value = "85%", inline = true}}
-    }
-}
-webhook:SendMultipleEmbeds(embeds)
+-- Edit with both content and embed
+webhook:EditMessage(knownMessageId, "Updated message", {
+    title = "Also Updated Embed",
+    color = 0x0099ff
+})
 
--- Automatic Player Join/Leave Notifications
+-- Delete the message
+webhook:DeleteMessage(knownMessageId)
+
+-- EXAMPLE 7: Working with Stored Messages
+local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
+    track_message_ids = true
+})
+
+-- Send some messages
+webhook:SendMessage("Message 1")
+webhook:SendMessage("Message 2")
+webhook:SendEmbed({title = "Embed Message"})
+
+-- Wait for messages to be sent and tracked
+task.wait(3)
+
+-- Get all stored messages
+local storedMessages = webhook:GetStoredMessages()
+for _, msg in ipairs(storedMessages) do
+    print("Message ID:", msg.id)
+    print("Type:", msg.metadata.type)
+    print("Timestamp:", msg.timestamp)
+    print("---")
+end
+
+-- Get the latest message ID
+local latestId = webhook:GetLatestMessageId()
+print("Latest message ID:", latestId)
+
+-- Clear stored messages
+webhook:ClearStoredMessages()
+
+-- EXAMPLE 8: Player Events with Thread Support
+local PLAYER_THREAD = "123456789012345678"
+
 game.Players.PlayerAdded:Connect(function(player)
-    pcall(function() -- Always wrap in pcall for production
-        webhook:SendJoinMessage(player)
+    pcall(function()
+        -- Send join message to specific thread
+        webhook:SendJoinMessage(player, PLAYER_THREAD)
     end)
 end)
 
 game.Players.PlayerRemoving:Connect(function(player)
     pcall(function()
-        webhook:SendLeaveMessage(player)
+        -- Send leave message to specific thread
+        webhook:SendLeaveMessage(player, PLAYER_THREAD)
     end)
 end)
 
--- Custom Event Logging
+-- EXAMPLE 9: Custom Events with Thread Support
+local EVENT_THREAD = "987654321098765432"
+
 webhook:SendCustomEvent("🎯 Player Achievement", {
     ["Player"] = "john_doe",
     ["Achievement"] = "First Victory!",
     ["Score"] = "9,999",
     ["Time"] = os.date("%c"),
     ["Difficulty"] = "Hard Mode"
-})
+}, EVENT_THREAD)
 
--- Runtime Configuration Changes
-webhook:SetDefaultUsername("🤖 Game Bot v2.0")
-webhook:SetDefaultColor(0xff6600) -- Orange
-webhook:EnableDebug(false) -- Disable for production
+-- EXAMPLE 10: Runtime Configuration
+webhook:EnableMessageTracking(true) -- Enable message tracking at runtime
+webhook:EnableDebug(true)
 webhook:EnableQueue(true, 3) -- Enable queue with 3 requests/second
 
--- Check Configuration
+-- Check configuration
+print("Message tracking enabled:", webhook:IsMessageTrackingEnabled())
 print("Queue enabled:", webhook:IsQueueEnabled())
 print("Queue size:", webhook:GetQueueSize())
-local config = webhook:GetConfiguration()
-print("Current username:", config.username)
 
--- Message with Custom Override
-webhook:SendMessage("📢 Special announcement from admin!", {
-    username = "📢 Admin Bot",
-    avatar_url = "https://cdn.discordapp.com/avatars/123/special-avatar.png"
+-- EXAMPLE 11: Advanced Message Management
+local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
+    debug = true,
+    track_message_ids = true,
+    queue_rate_limit = 1 -- 1 request per second
 })
 
--- Graceful Shutdown (Important for server closing)
-game:BindToClose(function()
-    print("Shutting down webhook...")
-    webhook:Shutdown() -- Ensures pending messages are sent
-    wait(2) -- Give it time to complete
-end)
-
--- Error Handling Example
-local success = webhook:SendMessage("Test message")
-if not success then
-    warn("Failed to queue webhook message")
+-- Function to send and track a message
+local function sendTrackedMessage(content)
+    webhook:SendMessage(content)
+    task.wait(2) -- Wait for message to be sent
+    local id = webhook:GetLatestMessageId()
+    print("Sent message with ID:", id)
+    return id
 end
 
--- Production-Ready Setup with Error Handling
-local function setupWebhook()
+-- Send messages and get their IDs
+local msg1Id = sendTrackedMessage("This is message 1")
+local msg2Id = sendTrackedMessage("This is message 2")
+local msg3Id = sendTrackedMessage("This is message 3")
+
+-- Edit the first message
+if msg1Id then
+    webhook:EditMessage(msg1Id, "Message 1 has been edited!")
+end
+
+-- Delete the second message
+if msg2Id then
+    webhook:DeleteMessage(msg2Id)
+end
+
+-- Edit the third message with an embed
+if msg3Id then
+    webhook:EditMessage(msg3Id, "Message 3 updated", {
+        title = "Updated Embed",
+        description = "This message now has an embed too!",
+        color = 0x00ff00
+    })
+end
+
+-- EXAMPLE 12: Error Handling for Message Operations
+local function safeEditMessage(messageId, content, embeds)
+    local success = pcall(function()
+        return webhook:EditMessage(messageId, content, embeds)
+    end)
+    
+    if success then
+        print("Message edit queued successfully")
+    else
+        warn("Failed to queue message edit")
+    end
+end
+
+local function safeDeleteMessage(messageId)
+    local success = pcall(function()
+        return webhook:DeleteMessage(messageId)
+    end)
+    
+    if success then
+        print("Message deletion queued successfully")
+    else
+        warn("Failed to queue message deletion")
+    end
+end
+
+-- EXAMPLE 13: Complete Production Setup
+local function setupProductionWebhook()
     local success, webhook = pcall(function()
         return WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
             username = "🎮 Production Game",
-            debug = false,
+            debug = false, -- Disable debug in production
             filter_profanity = true,
-            queue_rate_limit = 2, -- Prevent rate limiting
-            max_retries = 5
+            queue_rate_limit = 2, -- Prevent Discord rate limiting
+            max_retries = 5,
+            track_message_ids = true, -- Enable for message management
+            max_stored_messages = 100 -- Store up to 100 message IDs
         })
     end)
     
     if success then
         print("WebhookLib initialized successfully")
+        
+        -- Send startup message
+        pcall(function()
+            webhook:SendMessage("🚀 Production server started successfully!")
+        end)
+        
         return webhook
     else
         warn("Failed to initialize WebhookLib:", webhook)
@@ -1115,11 +1508,76 @@ local function setupWebhook()
     end
 end
 
-local webhook = setupWebhook()
-if webhook then
-    -- Safe message sending
-    pcall(function()
-        webhook:SendMessage("🚀 Production server started successfully!")
-    end)
+local webhook = setupProductionWebhook()
+
+-- Graceful Shutdown with Message Cleanup
+game:BindToClose(function()
+    if webhook then
+        print("Shutting down webhook...")
+        
+        -- Send shutdown message
+        pcall(function()
+            webhook:SendMessage("🔄 Server shutting down...")
+        end)
+        
+        -- Wait for messages to send
+        webhook:Shutdown()
+        task.wait(2)
+        
+        print("Webhook shutdown complete")
+    end
+end)
+
+-- EXAMPLE 14: Message Batch Operations
+local function batchEditMessages(webhook, messageIds, newContent)
+    for i, messageId in ipairs(messageIds) do
+        webhook:EditMessage(messageId, newContent .. " (Message " .. i .. ")")
+        task.wait(0.5) -- Small delay between operations
+    end
 end
+
+local function batchDeleteMessages(webhook, messageIds)
+    for _, messageId in ipairs(messageIds) do
+        webhook:DeleteMessage(messageId)
+        task.wait(0.5) -- Small delay between operations
+    end
+end
+
+-- EXAMPLE 15: Comprehensive Feature Demo
+local webhook = WebhookLib.new("https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN", {
+    username = "🤖 Feature Demo Bot",
+    debug = true,
+    track_message_ids = true,
+    queue_rate_limit = 2,
+    filter_profanity = true
+})
+
+-- Send various types of messages
+webhook:SendMessage("Welcome to the feature demo!")
+
+local threadId = "123456789012345678" -- Replace with actual thread ID
+webhook:SendMessageInThread("This message is in a thread!", threadId)
+
+webhook:SendEmbed({
+    title = "Demo Embed",
+    description = "This demonstrates embed functionality",
+    color = 0x0099ff,
+    fields = {
+        {name = "Feature", value = "Rich Embeds", inline = true},
+        {name = "Status", value = "✅ Working", inline = true}
+    }
+})
+
+-- Wait and then demonstrate editing
+task.wait(3)
+local latestId = webhook:GetLatestMessageId()
+if latestId then
+    webhook:EditMessage(latestId, nil, {
+        title = "Updated Demo Embed",
+        description = "This embed has been edited!",
+        color = 0xff6600
+    })
+end
+
+print("Demo complete! Check your Discord channel.")
 --]]
