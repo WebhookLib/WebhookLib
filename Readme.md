@@ -840,5 +840,5 @@ SOFTWARE.
 ---
 
 <div align="center">
-  <sub>Built with Lua • Designed for Roblox • Powered by Discord Webhooks • Enhanced with Thread & Message Management</sub>
+  <sub>Built with Lua • Designed for Roblox • Powered by Discord Webhooks</sub>
 </div>
