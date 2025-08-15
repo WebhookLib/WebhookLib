@@ -8,7 +8,7 @@
   [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
   [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/WebhookLib/WebhookLib/releases)
   [![Roblox Model](https://img.shields.io/badge/Roblox-Model-00A2FF.svg)](https://create.roblox.com/store/asset/101200026339651/WebhookLib)
-  [![Website](https://img.shields.io/badge/Website-webhooklib.luau.page-purple.svg)]([WebhookLib.github.io](https://webhooklib.github.io/))
+  [![Website](https://img.shields.io/badge/Website-webhooklib.github.io-purple.svg)](https://webhooklib.github.io/)
   [![Stars](https://img.shields.io/github/stars/WebhookLib/WebhookLib.svg)](https://github.com/WebhookLib/WebhookLib/stargazers)
   [![Issues](https://img.shields.io/github/issues/WebhookLib/WebhookLib.svg)](https://github.com/WebhookLib/WebhookLib/issues)
   [![Downloads](https://img.shields.io/badge/downloads-50-brightgreen.svg)](https://create.roblox.com/store/asset/101200026339651/WebhookLib)
